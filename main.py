@@ -21,6 +21,7 @@ app.add_middleware(
 DISCORD_CLIENT_ID = os.getenv('DISCORD_CLIENT_ID')
 DISCORD_CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET')
 DISCORD_REDIRECT_URI = os.getenv('DISCORD_REDIRECT_URI')
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 @app.get('/')
 def hello_world():
@@ -52,10 +53,26 @@ async def callback(request: Request):
 @app.get("/user")
 async def get_user(access_token: str):
     async with httpx.AsyncClient() as client:
-        response = await client.get(
+        user_response = await client.get(
             "https://discord.com/api/users/@me",
             headers={"Authorization": f"Bearer {access_token}"}
         )
-        return response.json()
+        user = user_response.json()
+        guilds_response = await client.get(
+            "https://discord.com/api/users/@me/guilds",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        guilds = guilds_response.json()
+        
+        bot_guilds_response = await client.get(
+            "https://discord.com/api/users/@me/guilds",
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+        )
+        bot_guilds = [guild['id'] for guild in bot_guilds_response.json()]
+        
+        for guild in guilds:
+            guild['has_bot'] = guild['id'] in bot_guilds
+        
+        return {"user": user, "guilds": guilds}
 
 # app.include_router(router)
