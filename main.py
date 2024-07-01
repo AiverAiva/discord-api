@@ -18,6 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+DISCORD_API_URL = "https://discord.com/api/v10"
 DISCORD_CLIENT_ID = os.getenv('DISCORD_CLIENT_ID')
 DISCORD_CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET')
 DISCORD_REDIRECT_URI = os.getenv('DISCORD_REDIRECT_URI')
@@ -29,7 +30,7 @@ def hello_world():
 
 @app.get("/login") 
 def login():
-    return RedirectResponse(f"https://discord.com/api/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify")
+    return RedirectResponse(f"https://discord.com/api/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify+guilds")
 
 @app.get("/callback")
 async def callback(request: Request):
@@ -47,32 +48,57 @@ async def callback(request: Request):
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         tokens = response.json()
-        access_token = tokens.get("access_token")
-        return {"access_token": access_token}
+        accessToken = tokens.get("access_token")
+        return {"accessToken": accessToken}
 
 @app.get("/user")
-async def get_user(access_token: str):
+async def get_user(accessToken: str):
     async with httpx.AsyncClient() as client:
+        # Get user info
         user_response = await client.get(
-            "https://discord.com/api/users/@me",
-            headers={"Authorization": f"Bearer {access_token}"}
+            f"{DISCORD_API_URL}/users/@me",
+            headers={"Authorization": f"Bearer {accessToken}"}
         )
-        user = user_response.json()
-        guilds_response = await client.get(
-            "https://discord.com/api/users/@me/guilds",
-            headers={"Authorization": f"Bearer {access_token}"}
-        )
-        guilds = guilds_response.json()
         
+        user_data = user_response.json()
+
+        guilds_response = await client.get(
+            f"{DISCORD_API_URL}/users/@me/guilds",
+            headers={"Authorization": f"Bearer {accessToken}"}
+        )
+        user_guilds = guilds_response.json()
+        # print(user_guilds)
+
         bot_guilds_response = await client.get(
-            "https://discord.com/api/users/@me/guilds",
+            f"{DISCORD_API_URL}/users/@me/guilds",
             headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
         )
-        bot_guilds = [guild['id'] for guild in bot_guilds_response.json()]
+        bot_guilds = bot_guilds_response.json()
         
-        for guild in guilds:
-            guild['has_bot'] = guild['id'] in bot_guilds
-        
-        return {"user": user, "guilds": guilds}
+        bot_guild_ids = {guild['id'] for guild in bot_guilds}
+
+        # Mark guilds where the bot is present
+        for guild in user_guilds:
+            guild['has_bot'] = guild['id'] in bot_guild_ids
+
+        user_id = user_data["id"]
+        avatar = user_data["avatar"]
+
+        avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png"
+        user_data["avatar_url"] = avatar_url
+        # bot_guild_ids = {guild['id'] for guild in bot_guilds}
+        # bot_guilds_data = [guild for guild in bot_guilds if guild['id'] in bot_guild_ids]
+ 
+        # user_guilds_with_bot = [guild for guild in user_guilds if guild['id'] in bot_guild_ids]
+        # for guild in user_guilds:
+        #     guild['has_bot'] = guild['id'] in bot_guild_ids
+ 
+        # return user_data
+        return {
+            "user": user_data,
+            "user_guilds": user_guilds,
+            # "bot_guilds": bot_guilds_data,
+            # "user_guilds_with_bot": user_guilds_with_bot
+        }   
 
 # app.include_router(router)
