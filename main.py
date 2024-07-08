@@ -27,6 +27,8 @@ DISCORD_CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET')
 DISCORD_REDIRECT_URI = os.getenv('DISCORD_REDIRECT_URI')
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
+MANAGE_GUILD_PERMISSION = 0x20  # MANAGE_GUILD permission bit
+
 @app.get('/')
 def hello_world():
     return "Hello,World"
@@ -133,9 +135,27 @@ async def get_discord_headers():
     return {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}"
     }
-
+async def verify_user_permissions(accessToken: str, guild_id: str) -> bool:
+    async with httpx.AsyncClient() as client:
+        guilds_response = await client.get(
+            f"{DISCORD_API_URL}/users/@me/guilds",
+            headers={"Authorization": f"Bearer {accessToken}"}
+        )
+        user_guilds = guilds_response.json()
+        
+        user_guild = next((guild for guild in user_guilds if guild["id"] == guild_id), None)
+        if user_guild is None:
+            return False
+        
+        user_permissions = user_guild.get("permissions", 0)
+        has_manage_guild = (int(user_permissions) & MANAGE_GUILD_PERMISSION) == MANAGE_GUILD_PERMISSION
+        return has_manage_guild
+    
 @app.get("/server/{server_id}", response_model=ServerDetails)
-async def get_server_details(server_id: str, headers: dict = Depends(get_discord_headers)):
+async def get_server_details(server_id: str, accessToken: str, headers: dict = Depends(get_discord_headers)):
+    if not await verify_user_permissions(accessToken, server_id):
+        raise HTTPException(status_code=403, detail="User does not have the required permissions")
+
     async with httpx.AsyncClient() as client:
         server_resp = await client.get(f"{DISCORD_API_URL}/guilds/{server_id}", headers=headers)
         roles_resp = await client.get(f"{DISCORD_API_URL}/guilds/{server_id}/roles", headers=headers)
