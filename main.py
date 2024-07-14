@@ -1,7 +1,9 @@
 from fastapi import FastAPI, Request, Depends, APIRouter, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
+from typing import Optional
 import httpx
 import os
 
@@ -9,7 +11,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI()
-# router = APIRouter(prefix="/api")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,9 +27,17 @@ DISCORD_CLIENT_ID = os.getenv('DISCORD_CLIENT_ID')
 DISCORD_CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET')
 DISCORD_REDIRECT_URI = os.getenv('DISCORD_REDIRECT_URI')
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+MONGODB_URL = os.getenv("MONGODB_URL")
 
 MANAGE_GUILD_PERMISSION = 0x20  # MANAGE_GUILD permission bit
 
+async def get_mongo_client():
+    client = AsyncIOMotorClient(MONGODB_URL)
+    try:
+        yield client
+    finally:
+        client.close()
+        
 @app.get('/')
 def hello_world():
     return "Hello,World"
@@ -59,7 +68,6 @@ async def callback(request: Request):
 @app.get("/user")
 async def get_user(accessToken: str):
     async with httpx.AsyncClient() as client:
-        # Get user info
         user_response = await client.get(
             f"{DISCORD_API_URL}/users/@me",
             headers={"Authorization": f"Bearer {accessToken}"}
@@ -72,7 +80,6 @@ async def get_user(accessToken: str):
             headers={"Authorization": f"Bearer {accessToken}"}
         )
         user_guilds = guilds_response.json()
-        # print(user_guilds)
 
         bot_guilds_response = await client.get(
             f"{DISCORD_API_URL}/users/@me/guilds",
@@ -82,34 +89,20 @@ async def get_user(accessToken: str):
         
         bot_guild_ids = {guild['id'] for guild in bot_guilds}
 
-        # Mark guilds where the bot is present
         for guild in user_guilds:
             guild['has_bot'] = guild['id'] in bot_guild_ids
-            # print(guild)
-
 
         user_id = user_data["id"]
         avatar = user_data["avatar"]
 
         avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png"
         user_data["avatar_url"] = avatar_url
-        # bot_guild_ids = {guild['id'] for guild in bot_guilds}
-        # bot_guilds_data = [guild for guild in bot_guilds if guild['id'] in bot_guild_ids]
- 
-        # user_guilds_with_bot = [guild for guild in user_guilds if guild['id'] in bot_guild_ids]
-        # for guild in user_guilds:
-        #     guild['has_bot'] = guild['id'] in bot_guild_ids
- 
-        # return user_data
-        # print(user_guilds)
+        
         return {
             "user": user_data,
             "user_guilds": user_guilds,
-            # "bot_guilds": bot_guilds_data,
-            # "user_guilds_with_bot": user_guilds_with_bot
         }   
 
-# app.include_router(router)
 
 class Role(BaseModel):
     id: str
@@ -131,6 +124,15 @@ class ServerDetails(BaseModel):
     roles: list[Role]
     channels: list[Channel]
 
+class Module(BaseModel):
+    id: str
+    enabled: bool
+    settings: dict
+
+class Guild(BaseModel):
+    guild_id: str
+    modules: Optional[list] = []
+    
 async def get_discord_headers():
     return {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}"
@@ -142,14 +144,31 @@ async def verify_user_permissions(accessToken: str, guild_id: str) -> bool:
             headers={"Authorization": f"Bearer {accessToken}"}
         )
         user_guilds = guilds_response.json()
-        
-        user_guild = next((guild for guild in user_guilds if guild["id"] == guild_id), None)
-        if user_guild is None:
+        try:
+            user_guild = next((guild for guild in user_guilds if guild["id"] == guild_id), None)
+            if user_guild is None:
+                return False
+            user_permissions = user_guild.get("permissions", 0)
+            has_manage_guild = (int(user_permissions) & MANAGE_GUILD_PERMISSION) == MANAGE_GUILD_PERMISSION
+            return has_manage_guild
+        except:
             return False
         
-        user_permissions = user_guild.get("permissions", 0)
-        has_manage_guild = (int(user_permissions) & MANAGE_GUILD_PERMISSION) == MANAGE_GUILD_PERMISSION
-        return has_manage_guild
+@app.get("/server/{server_id}/roles")
+async def get_server_details(server_id: str, accessToken: str, headers: dict = Depends(get_discord_headers)):
+    if not await verify_user_permissions(accessToken, server_id):
+        raise HTTPException(status_code=403, detail="User does not have the required permissions")
+
+    async with httpx.AsyncClient() as client:
+        roles_resp = await client.get(f"{DISCORD_API_URL}/guilds/{server_id}/roles", headers=headers)
+
+    if roles_resp.status_code != 200:
+        raise HTTPException(status_code=roles_resp.status_code, detail="Failed to fetch server details")
+
+    roles_data = roles_resp.json()
+    
+    roles = [{"id": role["id"], "name": role["name"], "permissions": role["permissions"], "color": role["color"]} for role in roles_data if role["name"] != "@everyone"]
+    return roles
     
 @app.get("/server/{server_id}", response_model=ServerDetails)
 async def get_server_details(server_id: str, accessToken: str, headers: dict = Depends(get_discord_headers)):
@@ -179,3 +198,82 @@ async def get_server_details(server_id: str, accessToken: str, headers: dict = D
     }
 
     return server_details
+
+@app.get("/guild/{guild_id}", response_model=Guild)
+async def get_guild(guild_id: str, accessToken: str, client: AsyncIOMotorClient = Depends(get_mongo_client)):
+    if not await verify_user_permissions(accessToken, guild_id):
+        raise HTTPException(status_code=403, detail="User does not have the required permissions")
+    
+    db = client['meow-bot']
+    guilds_collection = db['guilds']
+    
+    guild = await guilds_collection.find_one({"guild_id": guild_id})
+    
+    if guild is None:
+        guild = Guild(guild_id=guild_id, modules=[])
+        await guilds_collection.insert_one(guild.dict())
+    
+    return guild
+
+# a GET endpoint of /guild/{guild_id}/module, should return the module with the given id
+@app.get("/guild/{guild_id}/module/{module_id}", response_model=Module)
+async def get_guild_module(guild_id: str, module_id: str, accessToken: str, client: AsyncIOMotorClient = Depends(get_mongo_client)):
+    if not await verify_user_permissions(accessToken, guild_id):
+        raise HTTPException(status_code=403, detail="User does not have the required permissions")
+    
+    db = client['meow-bot']
+    guilds_collection = db['guilds']
+    
+    guild = await guilds_collection.find_one({"guild_id": guild_id})
+    
+    if guild is None:
+        raise HTTPException(status_code=404, detail="Guild not found")
+    
+    modules = guild.get("modules", [])
+    module = next((mod for mod in modules if mod['id'] == module_id), None)
+    
+    if module is None:
+        raise HTTPException(status_code=404, detail="Module not found")
+    
+    return module
+
+# TODO: the module should be in a model but I don't know how to make it work
+@app.post("/guild/{guild_id}/module", response_model=Guild)
+async def update_guild_module(guild_id: str, module: dict, accessToken: str, client: AsyncIOMotorClient = Depends(get_mongo_client)):
+    if not await verify_user_permissions(accessToken, guild_id):
+        raise HTTPException(status_code=403, detail="User does not have the required permissions")
+    
+    db = client['meow-bot']
+    guilds_collection = db['guilds']
+    
+    guild = await guilds_collection.find_one({"guild_id": guild_id})
+    if not guild:
+        raise HTTPException(status_code=404, detail="Guild not found")
+
+    modules = guild.get("modules", [])
+    
+    for i, mod in enumerate(modules):
+        if mod['id'] == module['id']:
+            modules[i] = module
+            break
+    else:
+        modules.append(module)
+    
+    await guilds_collection.update_one({"guild_id": guild_id}, {"$set": {"modules": modules}})
+    return Guild(guild_id=guild_id, modules=modules)
+
+@app.post("/guild/{guild_id}/modules", response_model=Guild)
+async def update_guild_modules(guild_id: str, modules: list[dict], accessToken: str, client: AsyncIOMotorClient = Depends(get_mongo_client)):
+    if not await verify_user_permissions(accessToken, guild_id):
+        raise HTTPException(status_code=403, detail="User does not have the required permissions")
+    
+    db = client['meow-bot']
+    guilds_collection = db['guilds']
+    
+    guild = await guilds_collection.find_one({"guild_id": guild_id})
+    if not guild:
+        raise HTTPException(status_code=404, detail="Guild not found")
+    
+    await guilds_collection.update_one({"guild_id": guild_id}, {"$set": {"modules": modules}})
+    return Guild(guild_id=guild_id, modules=modules)
+
